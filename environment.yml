@@ -1,0 +1,21 @@
+name: spectral_bulk
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - xarray
+  - pyproj
+  - cartopy
+  - geoviews
+  - holoviews
+  - hvplot
+  - bokeh
+  - jupyterlab
+  - ipykernel
+  - pip
+  - pip:
+      - git+https://github.com/englacial/xopr.git@thomas/qc_and_extras
