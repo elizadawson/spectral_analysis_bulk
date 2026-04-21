@@ -421,6 +421,190 @@ def compute_all_slopes_per_trace(
     )
 
 
+def compute_slope_per_trace(
+    radar_amp, f_mhz, delta_tau, f_min, f_max, window_size, bad_traces,
+    circular=False,
+):
+    """
+    Compute the spectral ratio slope (ln(bed / sfc) vs frequency) for each trace,
+    using three different per-trace aggregation pipelines:
+
+      * ``average`` – average raw sfc and bed spectra across the smoothing window,
+        then fit the slope of `ln(mean_bed / mean_sfc)`.
+      * ``normalize_average`` – divide each trace by its own raw peak (so every
+        trace contributes equally), average the normalized spectra, then fit.
+      * ``subtract_normalize_average`` – subtract the per-trace noise spectrum,
+        divide each trace by the peak of its noise-corrected spectrum, average,
+        then fit.
+
+    Parameters
+    ----------
+    radar_amp : dict
+        Dictionary with 'amp_sfc', 'amp_bottom', and 'amp_noise', each shaped
+        (n_traces, n_freq).
+    f_mhz : np.ndarray
+        Frequency array in MHz.
+    delta_tau : np.ndarray
+        Two-way travel time difference (bottom - surface), one value per trace (s).
+    f_min, f_max : float
+        Frequency band for the linear fit (MHz).
+    window_size : int
+        Number of neighboring traces averaged for each center trace (odd integer;
+        1 = no smoothing).
+    bad_traces : np.ndarray
+        Binary array indicating bad traces (1 for bad, 0 for good).
+    circular : bool, optional
+        If True, wrap neighbor indices at segment edges.
+
+    Returns
+    -------
+    results : dict
+        ``{
+            "pipelines": {
+                "average":                    {"slope": ..., "rmse": ..., "std_err": ...},
+                "normalize_average":          {"slope": ..., "rmse": ..., "std_err": ...},
+                "subtract_normalize_average": {"slope": ..., "rmse": ..., "std_err": ...},
+            },
+            "delta_tau_smooth": ..., "center_idx": ...,
+            "good_pct": ...,         "snr_bed":    ...,
+        }``
+        Pipeline-specific slope / RMSE / slope standard error are nested under
+        ``pipelines[name]``; quantities that do not depend on the pipeline
+        (smoothed delta_tau, center index, window good-pct, bed-over-noise SNR)
+        live at the top level. Use :func:`select_pipeline` to unpack a pipeline
+        into flat arrays for plotting.
+    """
+
+    half_win = window_size // 2
+    n_traces = radar_amp["amp_sfc"].shape[0]
+    f_mask = (f_mhz >= f_min) & (f_mhz <= f_max)
+    x_fit = f_mhz[f_mask]
+
+    amp_sfc_all    = np.asarray(radar_amp["amp_sfc"],    dtype=float)
+    amp_bottom_all = np.asarray(radar_amp["amp_bottom"], dtype=float)
+    amp_noise_all  = np.asarray(radar_amp["amp_noise"],  dtype=float)
+
+    pipeline_names = ("average", "normalize_average", "subtract_normalize_average")
+    pipelines = {
+        name: {
+            "slope":   np.full(n_traces, np.nan),
+            "rmse":    np.full(n_traces, np.nan),
+            "std_err": np.full(n_traces, np.nan),
+        }
+        for name in pipeline_names
+    }
+
+    delta_tau_smooth_arr = np.full(n_traces, np.nan)
+    center_idx_arr       = np.full(n_traces, np.nan)
+    good_pct_arr         = np.full(n_traces, np.nan)
+    snr_bed_arr          = np.full(n_traces, np.nan)
+
+    def _safe_peak(x):
+        p = np.nanmax(x, axis=1, keepdims=True)
+        return np.where(p > 0, p, np.nan)
+
+    def _fit_slope(amp_sfc_mean, amp_bottom_mean):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            y = np.log(amp_bottom_mean / amp_sfc_mean)
+        y_fit = y[f_mask]
+        valid = np.isfinite(y_fit)
+        if valid.sum() < 2:
+            return np.nan, np.nan, np.nan
+        slope, intercept, _, _, std_err = linregress(x_fit[valid], y_fit[valid])
+        y_pred = slope * x_fit[valid] + intercept
+        rmse = np.sqrt(np.mean((y_fit[valid] - y_pred) ** 2))
+        return slope, rmse, std_err
+
+    valid_idxs = np.where(bad_traces == 0)[0]
+    for i in tqdm(valid_idxs, desc="Computing Slopes"):
+        if circular:
+            idxs = [(i + j) % n_traces for j in range(-half_win, half_win + 1)]
+        else:
+            start = max(0, i - half_win)
+            end = min(n_traces, i + half_win + 1)
+            idxs = list(range(start, end))
+
+        sfc_win   = amp_sfc_all[idxs, :]
+        bed_win   = amp_bottom_all[idxs, :]
+        noise_win = amp_noise_all[idxs, :]
+
+        sfc_corr_win = sfc_win - noise_win
+        bed_corr_win = bed_win - noise_win
+
+        # 1) average raw spectra
+        amp_sfc_avg    = np.nanmean(sfc_win, axis=0)
+        amp_bottom_avg = np.nanmean(bed_win, axis=0)
+
+        # 2) normalize per-trace (by raw peak) then average
+        sfc_peak_raw = _safe_peak(sfc_win)
+        bed_peak_raw = _safe_peak(bed_win)
+        amp_sfc_norm_avg    = np.nanmean(sfc_win / sfc_peak_raw, axis=0)
+        amp_bottom_norm_avg = np.nanmean(bed_win / bed_peak_raw, axis=0)
+
+        # 3) subtract noise, normalize per-trace (by noise-subtracted peak), then average
+        sfc_peak_corr = _safe_peak(sfc_corr_win)
+        bed_peak_corr = _safe_peak(bed_corr_win)
+        amp_sfc_sub_norm_avg    = np.nanmean(sfc_corr_win / sfc_peak_corr, axis=0)
+        amp_bottom_sub_norm_avg = np.nanmean(bed_corr_win / bed_peak_corr, axis=0)
+
+        for name, (s_mean, b_mean) in zip(
+            pipeline_names,
+            (
+                (amp_sfc_avg,          amp_bottom_avg),
+                (amp_sfc_norm_avg,     amp_bottom_norm_avg),
+                (amp_sfc_sub_norm_avg, amp_bottom_sub_norm_avg),
+            ),
+        ):
+            slope, rmse, std_err = _fit_slope(s_mean, b_mean)
+            pipelines[name]["slope"][i]   = slope
+            pipelines[name]["rmse"][i]    = rmse
+            pipelines[name]["std_err"][i] = std_err
+
+        delta_tau_smooth_arr[i] = np.nanmean(delta_tau[idxs])
+        good_pct_arr[i] = 100 * np.mean(bad_traces[idxs] == 0)
+        center_idx_arr[i] = i
+
+        # Report-only bed SNR over the fit band (mean-power ratio, in dB),
+        # from the raw window-averaged spectra (pipeline-independent).
+        bed_band   = amp_bottom_avg[f_mask]
+        noise_band = np.nanmean(noise_win, axis=0)[f_mask]
+        if np.all(np.isfinite(bed_band) & np.isfinite(noise_band)):
+            mean_p_bed = np.mean(bed_band ** 2)
+            mean_p_noise = np.mean(noise_band ** 2)
+            if mean_p_noise > 0:
+                snr_bed_arr[i] = 10.0 * np.log10(mean_p_bed / mean_p_noise)
+
+    return {
+        "pipelines":        pipelines,
+        "delta_tau_smooth": delta_tau_smooth_arr,
+        "center_idx":       center_idx_arr,
+        "good_pct":         good_pct_arr,
+        "snr_bed":          snr_bed_arr,
+    }
+
+
+def select_pipeline(results, name):
+    """
+    Unpack one pipeline's outputs from :func:`compute_slope_per_trace` into the
+    flat tuple ``(slope, delta_tau_smooth, rmse, center_idx, good_pct, std_err,
+    snr_bed)`` used by the along-track / attenuation plots.
+    """
+    if name not in results["pipelines"]:
+        raise KeyError(
+            f"unknown pipeline {name!r}; options are {tuple(results['pipelines'])}"
+        )
+    p = results["pipelines"][name]
+    return (
+        p["slope"],
+        results["delta_tau_smooth"],
+        p["rmse"],
+        results["center_idx"],
+        results["good_pct"],
+        p["std_err"],
+        results["snr_bed"],
+    )
+
+
 def compute_slopes(
     radar_amp, f_mhz, f_min, f_max, bad_traces,
 ):
@@ -519,100 +703,50 @@ def compute_slopes(
 
 
 def calculate_attenuation(
-    slope_arr,
-    std_err_arr,
-    good_pct_arr,
-    delta_tau_smooth_arr,
-    fc,
-    std_err_thold,
-    good_pct_thold,
-    slope_thold,
-    epsilon_r=3.15,
+    slope_arr, std_err_arr, delta_tau_smooth_arr, fc, epsilon_r=3.15,
 ):
     """
-    Compute filtered attenuation (Na) and associated error using slope quality thresholds
-    and ±2σ outlier rejection.
+    Convert spectral ratio slope to one-way attenuation rate Na (dB/km) and
+    propagate the slope standard error into an uncertainty Na_unc (dB/km).
+
+    No filtering or outlier rejection — just the math. Na is linear in slope
+    (for fixed delta_tau), so propagation reduces to substituting std_err_arr
+    for slope_arr in the same formula and taking the magnitude.
 
     Parameters
     ----------
     slope_arr : np.ndarray
-        Array of spectral ratio slopes (log(amp_bottom / amp_sfc)).
+        Spectral ratio slopes in per-MHz (slope of ln(amp_bottom / amp_sfc)).
     std_err_arr : np.ndarray
-        Array of standard errors for each slope.
-    good_pct_arr : np.ndarray
-        Array of percentage of good traces in each smoothing window.
+        Standard error on each slope (same units as slope_arr).
     delta_tau_smooth_arr : np.ndarray
-        Smoothed two-way travel time difference between bed and surface for each trace.
+        Smoothed two-way travel time difference between bed and surface (s).
     fc : float
-        Central frequency in Hz.
-    std_err_thold : float, optional
-        Maximum standard error to keep a trace.
-    good_pct_thold : float, optional
-        Minimum percentage of good traces to keep a trace.
-    slope_thold : float, optional
-        Maximum slope value (must be negative or zero).
+        Center frequency (Hz).
     epsilon_r : float, optional
-        Relative permittivity of ice.
+        Relative permittivity of ice (default 3.15).
 
     Returns
     -------
-    Na_filtered : np.ndarray
-        Attenuation rate (in dB/km) after filtering and outlier removal.
-    Na_err_filtered : np.ndarray
-        Associated error in attenuation rate.
-    Na_clean : np.ndarray
-        Na values used to calculate stats.
-    lower_bound : float
-        Lower 2σ bound.
-    upper_bound : float
-        Upper 2σ bound.
+    Na_arr : np.ndarray
+        Attenuation rate in dB/km.
+    Na_unc_arr : np.ndarray
+        1-sigma uncertainty in Na (dB/km), propagated from std_err_arr.
     """
 
-    # Filter based on error, trace quality, and slope sign
-    slope_filtered = np.where(
-        (std_err_arr < std_err_thold)
-        & (good_pct_arr >= good_pct_thold)
-        & (slope_arr <= slope_thold),
-        slope_arr,
-        np.nan,
-    )
+    c_light = 2.998e8
+    vp = c_light / np.sqrt(epsilon_r)
 
-    std_err_filtered = np.where(
-        (std_err_arr < std_err_thold)
-        & (good_pct_arr >= good_pct_thold)
-        & (slope_arr <= slope_thold),
-        std_err_arr,
-        np.nan,
-    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        Q = delta_tau_smooth_arr * np.pi / slope_arr
+        alpha = np.pi * fc / (vp * Q) / 1e6  # slope_arr is per-MHz; 1/m -> 1/km
+        Na_arr = -8.686 * alpha * 1000       # dB/km
 
-    # Speed of radar wave in ice
-    c = 2.998e8  # m/s
-    vp = c / np.sqrt(epsilon_r)
+        Q_unc = delta_tau_smooth_arr * np.pi / std_err_arr
+        alpha_unc = np.pi * fc / (vp * Q_unc) / 1e6
+        Na_unc_arr = np.abs(-8.686 * alpha_unc * 1000)
 
-    # Compute Q and attenuation
-    Q = delta_tau_smooth_arr * np.pi / slope_filtered
-    alpha = np.pi * fc / (vp * Q) / 1e6  # 1/m to 1/km
-    Na_arr = -8.686 * alpha * 1000  # dB/km
-
-    # Error propagation
-    Q_err = delta_tau_smooth_arr * np.pi / std_err_filtered
-    alpha_err = np.pi * fc / (vp * Q_err) / 1e6
-    Na_err_arr = abs(-8.686 * alpha_err * 1000)
-
-    # Outlier removal (±2σ)
-    Na_clean = Na_arr[~np.isnan(Na_arr)]
-    mean_Na = np.mean(Na_clean)
-    std_Na = np.std(Na_clean)
-    lower_bound = mean_Na - 2 * std_Na
-    upper_bound = mean_Na + 2 * std_Na
-
-    Na_filtered = Na_arr.copy()
-    Na_err_filtered = Na_err_arr.copy()
-    outlier_mask = (Na_filtered < lower_bound) | (Na_filtered > upper_bound)
-    Na_filtered[outlier_mask] = np.nan
-    Na_err_filtered[outlier_mask] = np.nan
-
-    return Na_filtered, Na_err_filtered, Na_clean, lower_bound, upper_bound, slope_filtered, std_err_filtered
+    return Na_arr, Na_unc_arr
 
 
 def save_frequency_attenuation_results(
