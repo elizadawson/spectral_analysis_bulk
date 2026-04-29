@@ -18,4 +18,4 @@ dependencies:
   - ipykernel
   - pip
   - pip:
-      - git+https://github.com/englacial/xopr.git@thomas/qc_and_extras
+      - git+https://github.com/englacial/xopr.git@main
